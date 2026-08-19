@@ -64,22 +64,47 @@ func pidAlive(pid int) bool {
 
 // TouchBeat updates the Beat timestamp for an agent in the registry.
 func TouchBeat(id string) {
-	agents, err := LoadRegistry()
-	if err != nil {
-		return
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	for i, a := range agents {
-		if a.ID == id {
-			agents[i].Beat = now
-			_ = saveRegistry(agents)
-			return
+	_ = withRegistryLock(func() error {
+		agents, err := LoadRegistry()
+		if err != nil {
+			return nil
 		}
-	}
+		now := time.Now().UTC().Format(time.RFC3339)
+		for i, a := range agents {
+			if a.ID == id {
+				agents[i].Beat = now
+				return saveRegistry(agents)
+			}
+		}
+		return nil
+	})
 }
 
 func registryPath() string {
 	return filepath.Join(ipcDir(), "registry.json")
+}
+
+func lockPath() string {
+	return filepath.Join(ipcDir(), "registry.lock")
+}
+
+// withRegistryLock acquires an exclusive file lock, runs fn, then releases.
+// Prevents concurrent read-modify-write races when multiple sessions
+// call Register, TouchBeat, or gc simultaneously.
+func withRegistryLock(fn func() error) error {
+	if err := os.MkdirAll(ipcDir(), 0755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(lockPath(), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint
+	return fn()
 }
 
 func LoadRegistry() ([]Agent, error) {
@@ -108,45 +133,49 @@ func saveRegistry(agents []Agent) error {
 }
 
 func Register(a Agent) error {
-	agents, err := LoadRegistry()
-	if err != nil {
-		return err
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	a.V = 1
-	a.Status = "active"
-	a.Beat = now
-	found := false
-	for i, existing := range agents {
-		if existing.ID == a.ID {
-			a.Since = existing.Since
-			agents[i] = a
-			found = true
-			break
-		}
-	}
-	if !found {
-		a.Since = now
-		agents = append(agents, a)
-	}
 	if err := os.MkdirAll(InboxPath(a.ID), 0755); err != nil {
 		return err
 	}
-	return saveRegistry(agents)
+	return withRegistryLock(func() error {
+		agents, err := LoadRegistry()
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		a.V = 1
+		a.Status = "active"
+		a.Beat = now
+		found := false
+		for i, existing := range agents {
+			if existing.ID == a.ID {
+				a.Since = existing.Since
+				agents[i] = a
+				found = true
+				break
+			}
+		}
+		if !found {
+			a.Since = now
+			agents = append(agents, a)
+		}
+		return saveRegistry(agents)
+	})
 }
 
 func Deregister(id string) error {
-	agents, err := LoadRegistry()
-	if err != nil {
-		return err
-	}
-	filtered := agents[:0]
-	for _, a := range agents {
-		if a.ID != id {
-			filtered = append(filtered, a)
+	return withRegistryLock(func() error {
+		agents, err := LoadRegistry()
+		if err != nil {
+			return err
 		}
-	}
-	return saveRegistry(filtered)
+		filtered := agents[:0]
+		for _, a := range agents {
+			if a.ID != id {
+				filtered = append(filtered, a)
+			}
+		}
+		return saveRegistry(filtered)
+	})
 }
 
 // AutoAgent builds an Agent from context in dir (or current directory if empty).

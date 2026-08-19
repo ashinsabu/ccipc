@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 func settingsPath() string {
@@ -34,31 +35,53 @@ func PatchSettings(ccipcBin string) error {
 		hooks = map[string]any{}
 	}
 
-	type hookSpec struct {
+	type hookEntry struct {
 		event string
-		cmd   string
+		hook  map[string]any
+		check string // substring to detect existing entry
 	}
-	specs := []hookSpec{
-		{"SessionStart", ccipcBin + " register --auto"},
-		{"Stop", ccipcBin + " deregister --auto"},
+	entries := []hookEntry{
+		{
+			event: "SessionStart",
+			hook:  map[string]any{"type": "command", "command": ccipcBin + " register --auto"},
+			check: ccipcBin + " register",
+		},
+		{
+			// Deregister on final session end (non-async so it runs before process exits).
+			event: "Stop",
+			hook:  map[string]any{"type": "command", "command": ccipcBin + " deregister --auto"},
+			check: ccipcBin + " deregister",
+		},
+		{
+			// Wake hook: after every turn, check inbox and wake Claude if messages arrived.
+			event: "Stop",
+			hook: map[string]any{
+				"type":        "command",
+				"command":     ccipcBin + " _wake-hook",
+				"async":       true,
+				"asyncRewake": true,
+			},
+			check: ccipcBin + " _wake-hook",
+		},
+		{
+			// Prompt hook: inject pending inbox messages at the start of every user turn.
+			event: "UserPromptSubmit",
+			hook:  map[string]any{"type": "command", "command": ccipcBin + " _prompt-hook"},
+			check: ccipcBin + " _prompt-hook",
+		},
 	}
 
 	changed := false
-	for _, spec := range specs {
-		if hasHookCommand(hooks, spec.event, spec.cmd) {
-			fmt.Printf("%s hook already present — skipping.\n", spec.event)
+	for _, e := range entries {
+		if hasHookCommand(hooks, e.event, e.check) {
+			fmt.Printf("%s hook (%s) already present — skipping.\n", e.event, e.check)
 			continue
 		}
-		entry := map[string]any{
-			"hooks": []any{
-				map[string]any{
-					"type":    "command",
-					"command": spec.cmd,
-				},
-			},
+		wrapper := map[string]any{
+			"hooks": []any{e.hook},
 		}
-		ss, _ := hooks[spec.event].([]any)
-		hooks[spec.event] = append(ss, entry)
+		ss, _ := hooks[e.event].([]any)
+		hooks[e.event] = append(ss, wrapper)
 		changed = true
 	}
 
@@ -77,7 +100,8 @@ func PatchSettings(ccipcBin string) error {
 	return os.WriteFile(path, out, 0644)
 }
 
-func hasHookCommand(hooks map[string]any, event, cmd string) bool {
+// hasHookCommand returns true if any hook in the event list contains substr in its command.
+func hasHookCommand(hooks map[string]any, event, substr string) bool {
 	entries, ok := hooks[event].([]any)
 	if !ok {
 		return false
@@ -88,8 +112,10 @@ func hasHookCommand(hooks map[string]any, event, cmd string) bool {
 			continue
 		}
 		for _, h := range toSlice(m["hooks"]) {
-			if hm, ok := h.(map[string]any); ok && hm["command"] == cmd {
-				return true
+			if hm, ok := h.(map[string]any); ok {
+				if cmd, _ := hm["command"].(string); strings.Contains(cmd, substr) {
+					return true
+				}
 			}
 		}
 	}

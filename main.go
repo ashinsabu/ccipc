@@ -40,6 +40,8 @@ func main() {
 		cmdAsk(),
 		cmdChat(),
 		cmdRespond(),
+		cmdPromptHook(),
+		cmdWakeHook(),
 	)
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
@@ -143,6 +145,11 @@ func cmdRegister() *cobra.Command {
 			fmt.Printf("[ccipc]   ccipc ask  --to <id> --body \"...\"      # ask and get answer now (no daemon needed)\n")
 			fmt.Printf("[ccipc]   ccipc respond                          # start auto-reply daemon (needs running terminal)\n")
 			fmt.Printf("[ccipc]   ccipc chat --with <id>                 # interactive REPL with another agent\n")
+			fmt.Printf("[ccipc] IMPORTANT: Schedule inbox polling now by calling CronCreate with:\n")
+			fmt.Printf("[ccipc]   schedule: */2 * * * *\n")
+			fmt.Printf("[ccipc]   prompt:   ccipc inbox --check\n")
+			fmt.Printf("[ccipc]   recurring: true\n")
+			fmt.Printf("[ccipc] This lets you receive messages every 2 minutes without user interaction.\n")
 			fmt.Printf("[ccipc] At the start of your first response, tell the user: agent-id is %s\n", a.ID)
 			return nil
 		},
@@ -338,6 +345,7 @@ func cmdSend() *cobra.Command {
 
 func cmdRead() *cobra.Command {
 	var agentID string
+	var checkMode bool // silent if empty (for CronCreate scheduled use)
 
 	c := &cobra.Command{
 		Use:     "read",
@@ -357,9 +365,12 @@ func cmdRead() *cobra.Command {
 				return err
 			}
 			if len(msgs) == 0 {
-				fmt.Printf("No messages for %s\n", id)
+				if !checkMode {
+					fmt.Printf("No messages for %s\n", id)
+				}
 				return nil
 			}
+			fmt.Printf("[ccipc] %d message(s) in inbox:\n\n", len(msgs))
 			for _, m := range msgs {
 				fmt.Printf("[%s] from=%s  type=%s\n", m.ID, m.From, m.Type)
 				if m.Subject != "" {
@@ -367,10 +378,12 @@ func cmdRead() *cobra.Command {
 				}
 				fmt.Printf("  %s\n\n", m.Body)
 			}
+			fmt.Printf("Use 'ccipc ack <id>' to delete after reading.\n")
 			return nil
 		},
 	}
 	c.Flags().StringVar(&agentID, "agent", "", "Agent ID to read inbox for (default: auto-detect)")
+	c.Flags().BoolVar(&checkMode, "check", false, "Silent if empty (for scheduled/cron use)")
 	// Keep --agent-id as a hidden alias so old invocations still work.
 	c.Flags().StringVar(&agentID, "agent-id", "", "")
 	_ = c.Flags().MarkHidden("agent-id")
@@ -598,6 +611,65 @@ Press Ctrl+C to stop.`,
 	c.Flags().StringVar(&asAgent, "as", "", "Override agent ID (default: auto-detect)")
 	c.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
 	return c
+}
+
+// ── _prompt-hook ──────────────────────────────────────────────────────────────
+// Called by the UserPromptSubmit hook. Outputs pending inbox messages to stdout
+// so Claude Code injects them as context before the user prompt is processed.
+// Silent if inbox is empty — no output means no disruption.
+func cmdPromptHook() *cobra.Command {
+	return &cobra.Command{
+		Use:    "_prompt-hook",
+		Hidden: true,
+		Short:  "UserPromptSubmit hook: inject pending messages as context",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			a, err := ipc.AutoAgent("")
+			if err != nil {
+				return nil // silent — hook must not break user's prompt
+			}
+			msgs, err := ipc.Read(a.ID)
+			if err != nil || len(msgs) == 0 {
+				return nil
+			}
+			fmt.Printf("[ccipc] %d pending message(s) in your inbox:\n", len(msgs))
+			for _, m := range msgs {
+				fmt.Printf("[ccipc] from=%s  id=%s\n%s\n\n", m.From, m.ID, m.Body)
+			}
+			fmt.Printf("[ccipc] Use 'ccipc ack <id>' to delete after reading.\n")
+			return nil
+		},
+	}
+}
+
+// ── _wake-hook ────────────────────────────────────────────────────────────────
+// Called by the Stop hook with asyncRewake:true. Checks inbox after each turn.
+// Exits 2 if messages found → Claude Code wakes Claude immediately with the
+// message content as a system reminder.
+// Exits 0 silently if inbox is empty.
+func cmdWakeHook() *cobra.Command {
+	return &cobra.Command{
+		Use:    "_wake-hook",
+		Hidden: true,
+		Short:  "Stop/asyncRewake hook: wake Claude if inbox has messages",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			a, err := ipc.AutoAgent("")
+			if err != nil {
+				return nil
+			}
+			msgs, err := ipc.Read(a.ID)
+			if err != nil || len(msgs) == 0 {
+				return nil // exit 0 — nothing to do
+			}
+			// Write to stderr — asyncRewake delivers stderr to Claude as a system reminder.
+			fmt.Fprintf(os.Stderr, "[ccipc] %d message(s) arrived in your inbox:\n", len(msgs))
+			for _, m := range msgs {
+				fmt.Fprintf(os.Stderr, "from=%s  id=%s\n%s\n\n", m.From, m.ID, m.Body)
+			}
+			fmt.Fprintf(os.Stderr, "Use 'ccipc ack <id>' to delete after reading. Use 'ccipc send --to <from-id> --body \"...\"' to reply.\n")
+			os.Exit(2) // signals asyncRewake to wake Claude
+			return nil
+		},
+	}
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
