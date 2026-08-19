@@ -19,6 +19,13 @@ func main() {
 	root := &cobra.Command{
 		Use:   "ccipc",
 		Short: "Claude Code IPC — local agent message bus",
+		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			// Refresh Beat on every command so the session stays visible in `ls`
+			// even if the Claude process PID changes (model switch, /clear, etc).
+			if a, err := ipc.AutoAgent(""); err == nil {
+				ipc.TouchBeat(a.ID)
+			}
+		},
 	}
 	root.AddCommand(
 		cmdInstall(),

@@ -30,17 +30,52 @@ type Agent struct {
 	V       int      `json:"v"`
 }
 
-// IsAlive returns true if the agent's recorded PID is still running.
-// Returns true when PID is unknown (0) to avoid false evictions of legacy entries.
+const beatTTL = 1 * time.Hour
+
+// IsAlive returns true if the agent is considered live.
+// An agent is live if its PID is still running OR its Beat timestamp is recent
+// (within beatTTL). The Beat fallback handles cases where Claude Code restarts
+// its process internally (model switch, /clear, auto-update) while the session
+// continues — the PID changes but the session is still active.
 func IsAlive(a Agent) bool {
-	if a.PID == 0 {
+	if pidAlive(a.PID) {
 		return true
 	}
-	proc, err := os.FindProcess(a.PID)
+	if a.Beat == "" {
+		return a.PID == 0 // legacy entry with no beat: keep it
+	}
+	t, err := time.Parse(time.RFC3339, a.Beat)
+	if err != nil {
+		return false
+	}
+	return time.Since(t) < beatTTL
+}
+
+func pidAlive(pid int) bool {
+	if pid == 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
 	if err != nil {
 		return false
 	}
 	return proc.Signal(syscall.Signal(0)) == nil
+}
+
+// TouchBeat updates the Beat timestamp for an agent in the registry.
+func TouchBeat(id string) {
+	agents, err := LoadRegistry()
+	if err != nil {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	for i, a := range agents {
+		if a.ID == id {
+			agents[i].Beat = now
+			_ = saveRegistry(agents)
+			return
+		}
+	}
 }
 
 func registryPath() string {
